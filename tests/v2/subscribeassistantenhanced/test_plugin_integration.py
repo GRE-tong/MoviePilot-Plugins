@@ -13,6 +13,7 @@ from app.schemas.types import MediaType
 
 from subscribeassistantenhanced import SubscribeAssistantEnhanced
 from subscribeassistantenhanced.engine.types import CompletionEvidence, CompletionSignal, PauseRecord
+from subscribeassistantenhanced.lifecycle import LifecycleResult
 
 
 def _sub(**kwargs):
@@ -716,6 +717,30 @@ def test_run_meta_check_includes_episode_best_version_subscription():
     airing.check.assert_called_once()
 
 
+def test_run_meta_check_delegates_each_subscription_to_lifecycle():
+    """元数据巡检入口只负责枚举订阅，单订阅生命周期顺序交给协调器。"""
+    subscriptions = [
+        _sub(id=1, state="N"),
+        _sub(id=2, state="R"),
+        _sub(id=3, state="P"),
+        _sub(id=4, state="S"),
+    ]
+    plugin = SubscribeAssistantEnhanced()
+    plugin.init_plugin({})
+    plugin._subscribe_oper = MagicMock()
+    plugin._subscribe_oper.list.return_value = subscriptions
+    lifecycle = MagicMock()
+    plugin._modules["lifecycle"] = lifecycle
+
+    plugin.run_meta_check()
+
+    plugin._subscribe_oper.list.assert_called_once_with(state="N,R,P,S")
+    assert [
+        call.args[0].id
+        for call in lifecycle.handle_meta_check_subscription.call_args_list
+    ] == [1, 2, 3, 4]
+
+
 def test_run_site_evidence_scan_refreshes_active_tv_subscriptions():
     """站点证据扫描刷新 P/R 普通剧集和分集洗版证据。"""
     normal = _sub(id=3, state="R", name="普通", best_version=0, type="电视剧")
@@ -874,6 +899,12 @@ def test_run_meta_check_full_best_version_continue_keeps_following_subscriptions
     plugin.init_plugin({"pause_enhanced_enabled": True, "pending_enhanced_enabled": True})
     plugin._subscribe_oper = MagicMock()
     plugin._subscribe_oper.list.return_value = [full, normal]
+    plugin._modules["pending_state"]._subscribe_oper = plugin._subscribe_oper
+    data_store = {"subscribes": {}}
+    plugin.get_data = MagicMock(side_effect=lambda key: data_store.get(key, {}))
+    plugin.save_data = MagicMock(side_effect=lambda key, value: data_store.__setitem__(key, value))
+    plugin._task_manager._get = plugin.get_data
+    plugin._task_manager._save = plugin.save_data
     full_mediainfo = SimpleNamespace(
         tmdb_id=100,
         type=MediaType.TV,
@@ -899,13 +930,17 @@ def test_run_meta_check_full_best_version_continue_keeps_following_subscriptions
     airing.check = MagicMock(return_value=None)
     judge = plugin._modules["pending_judge"]
     judge.should_enter_pending = MagicMock(return_value=(True, "集数不足"))
-    judge.mark_pending = MagicMock()
+    judge._notify = MagicMock()
 
     plugin.run_meta_check()
 
     assert plugin._recognize_mediainfo.call_args_list == [((full,),), ((normal,),)]
     judge.should_enter_pending.assert_called_once_with(normal, normal_mediainfo, episodes)
-    judge.mark_pending.assert_called_once_with(normal, source="pending_judge", reason="集数不足")
+    task = data_store["subscribes"]["4"]
+    assert task["state"] == "P"
+    assert task["source"] == "pending_judge"
+    assert plugin._subscribe_oper.update.call_args.args[0] == normal.id
+    assert plugin._subscribe_oper.update.call_args.args[1].get("state") == "P"
 
 
 def test_run_meta_check_resumes_full_best_version_pre_air_pause_when_condition_clears():
@@ -1421,12 +1456,18 @@ def test_run_meta_check_clears_flag_when_user_reenabled():
 
 
 def test_run_meta_check_marks_pending_when_should_enter_pending():
-    """活动订阅未命中暂停但 pending 条件成立时，run_meta_check 调用 pending_judge.mark_pending。"""
+    """活动订阅未命中暂停但 pending 条件成立时，应通过生命周期进入待定状态。"""
     sub = _sub(id=4, state="R", name="X", best_version=0, type="电视剧")
     plugin = SubscribeAssistantEnhanced()
     plugin.init_plugin({"pause_enhanced_enabled": True, "pending_enhanced_enabled": True})
     plugin._subscribe_oper = MagicMock()
     plugin._subscribe_oper.list.return_value = [sub]
+    plugin._modules["pending_state"]._subscribe_oper = plugin._subscribe_oper
+    data_store = {"subscribes": {}}
+    plugin.get_data = MagicMock(side_effect=lambda key: data_store.get(key, {}))
+    plugin.save_data = MagicMock(side_effect=lambda key, value: data_store.__setitem__(key, value))
+    plugin._task_manager._get = plugin.get_data
+    plugin._task_manager._save = plugin.save_data
     plugin._recognize_mediainfo = MagicMock(return_value=SimpleNamespace(tmdb_id=100, type=None))
     plugin._tmdb_episodes = MagicMock(return_value=[])
 
@@ -1437,13 +1478,16 @@ def test_run_meta_check_marks_pending_when_should_enter_pending():
 
     judge = plugin._modules["pending_judge"]
     judge.should_enter_pending = MagicMock(return_value=(True, "集数不足"))
-    judge.mark_pending = MagicMock()
+    judge._notify = MagicMock()
 
     plugin.run_meta_check()
 
-    judge.mark_pending.assert_called_once()
-    call_args = judge.mark_pending.call_args
-    assert call_args.kwargs.get("source") == "pending_judge"
+    task = data_store["subscribes"]["4"]
+    assert task["state"] == "P"
+    assert task["source"] == "pending_judge"
+    assert task["reason"] == "集数不足"
+    assert plugin._subscribe_oper.update.call_args.args[0] == sub.id
+    assert plugin._subscribe_oper.update.call_args.args[1].get("state") == "P"
 
 
 def test_run_meta_check_new_pending_schedules_initial_search_before_pending():
@@ -1453,20 +1497,32 @@ def test_run_meta_check_new_pending_schedules_initial_search_before_pending():
     plugin.init_plugin({"pause_enhanced_enabled": True, "pending_enhanced_enabled": True})
     plugin._subscribe_oper = MagicMock()
     plugin._subscribe_oper.list.return_value = [sub]
+    plugin._modules["pending_state"]._subscribe_oper = plugin._subscribe_oper
+    data_store = {"subscribes": {}}
+    plugin.get_data = MagicMock(side_effect=lambda key: data_store.get(key, {}))
+    plugin.save_data = MagicMock(side_effect=lambda key, value: data_store.__setitem__(key, value))
+    plugin._task_manager._get = plugin.get_data
+    plugin._task_manager._save = plugin.save_data
     plugin._recognize_mediainfo = MagicMock(return_value=SimpleNamespace(tmdb_id=100, type=None))
     plugin._tmdb_episodes = MagicMock(return_value=[])
 
     call_order = []
     plugin._schedule_initial_pending_search = MagicMock(side_effect=lambda _sub: call_order.append("search"))
+    plugin._subscribe_oper.update.side_effect = (
+        lambda _sid, payload: call_order.append("pending") if payload.get("state") == "P" else None
+    )
 
     judge = plugin._modules["pending_judge"]
     judge.should_enter_pending = MagicMock(return_value=(True, "集数不足"))
-    judge.mark_pending = MagicMock(side_effect=lambda *_args, **_kwargs: call_order.append("pending"))
+    judge._notify = MagicMock()
 
     plugin.run_meta_check()
 
     plugin._schedule_initial_pending_search.assert_called_once_with(sub)
-    judge.mark_pending.assert_called_once_with(sub, source="pending_judge", reason="集数不足")
+    task = data_store["subscribes"]["4"]
+    assert task["state"] == "P"
+    assert task["source"] == "pending_judge"
+    assert task["reason"] == "集数不足"
     assert call_order == ["search", "pending"]
 
 
@@ -1815,6 +1871,27 @@ def test_pending_state_reconcile_restores_owned_p_without_sources():
     plugin._subscribe_oper.update.assert_called_once()
     assert plugin._subscribe_oper.update.call_args.args[1]["state"] == "R"
     assert data_store["subscribes"]["7"]["state"] == "R"
+
+
+def test_pending_state_reconcile_delegates_each_p_subscription_to_lifecycle():
+    """待定状态一致性入口只枚举 P 订阅，恢复策略由生命周期协调器维护。"""
+    sub = _sub(id=7, state="P")
+    plugin = SubscribeAssistantEnhanced()
+    plugin.init_plugin({})
+    plugin._subscribe_oper = MagicMock()
+    plugin._subscribe_oper.list.return_value = [sub]
+    lifecycle = MagicMock()
+    plugin._modules["lifecycle"] = lifecycle
+    pending_state = plugin._modules["pending_state"]
+    pending_state.reconcile_orphaned = MagicMock(return_value=True)
+
+    plugin.run_pending_state_reconcile()
+
+    lifecycle.reconcile_pending.assert_called_once_with(
+        sub,
+        reason="待定状态一致性检查",
+    )
+    pending_state.reconcile_orphaned.assert_not_called()
 
 
 def test_pending_state_reconcile_restores_orphan_observation_and_keeps_active_guard_source():
@@ -2312,12 +2389,16 @@ class TestEventDelegation:
         # init_plugin 时注入的是绑定方法；替换 mock 后需同步给事件代理，验证入口 wiring 与事件链路。
         plugin._event_proxy._modules["resolve_missing_fn"] = plugin._resolve_subscribe_missing
         plugin._event_proxy._modules["recognize_mediainfo_fn"] = plugin._recognize_mediainfo
+        lifecycle = plugin._modules["lifecycle"]
+        lifecycle._subscribe_oper = oper
+        lifecycle.handle_library_updated = MagicMock(wraps=lifecycle.handle_library_updated)
 
         plugin.on_transfer_complete(SimpleNamespace(event_data={
             "download_hash": "abc",
             "transferinfo": None,
         }))
 
+        lifecycle.handle_library_updated.assert_called_once_with(7)
         converter.convert_to_full.assert_called_once_with(sub, mediainfo)
 
     def test_transfer_complete_event_pauses_after_lack_is_refreshed(self):
@@ -2360,12 +2441,16 @@ class TestEventDelegation:
         )
         pause_manager = plugin._modules["pause_manager"]
         pause_manager.pause = MagicMock()
+        lifecycle = plugin._modules["lifecycle"]
+        lifecycle._subscribe_oper = oper
+        lifecycle.handle_library_updated = MagicMock(wraps=lifecycle.handle_library_updated)
 
         plugin.on_transfer_complete(SimpleNamespace(event_data={
             "download_hash": "abc",
             "transferinfo": None,
         }))
 
+        lifecycle.handle_library_updated.assert_called_once_with(7)
         pause_manager.pause.assert_called_once()
         record = pause_manager.pause.call_args.args[1]
         assert record.reason == "airing_gap"
@@ -2706,7 +2791,60 @@ class TestPeriodicJobs:
         plugin.run_pending_release()
 
         pending_judge.check_exit.assert_called_once()
+        assert pending_judge.check_exit.call_args.kwargs["source"] == "guard_veto"
         plugin._modules["timeout_manager"].clear_observation.assert_not_called()
+
+    def test_pending_release_delegates_active_p_to_lifecycle(self):
+        """待定释放巡检只调度生命周期协调器，不在入口重复待定退出判定。"""
+        plugin = SubscribeAssistantEnhanced()
+        plugin.init_plugin({})
+        sub = _sub(id=7, state="P")
+        plugin._subscribe_oper = MagicMock()
+        plugin._subscribe_oper.list.return_value = [sub]
+        plugin._subscribe_oper.get.return_value = sub
+        plugin.get_data = MagicMock(return_value={})
+        lifecycle = MagicMock()
+        plugin._modules["lifecycle"] = lifecycle
+        pending_judge = plugin._modules["pending_judge"]
+        pending_judge.check_exit = MagicMock(return_value=True)
+
+        plugin.run_pending_release()
+
+        lifecycle.release_pending_source.assert_called_once_with(
+            sub,
+            source="pending_judge",
+            reason="待定释放巡检",
+        )
+        pending_judge.check_exit.assert_not_called()
+
+    def test_pending_release_delegates_active_guard_veto_source_to_lifecycle(self):
+        """活跃 guard_veto 定时释放必须把 guard_veto source 交给生命周期层。"""
+        plugin = SubscribeAssistantEnhanced()
+        plugin.init_plugin({})
+        sub = _sub(id=8, state="P")
+        plugin._subscribe_oper = MagicMock()
+        plugin._subscribe_oper.list.return_value = [sub]
+        plugin._subscribe_oper.get.return_value = sub
+        plugin.get_data = MagicMock(return_value={
+            "8": {
+                "state": "P",
+                "source": "pending_judge",
+                "pending_sources": {
+                    "pending_judge": {"reason": "集数不足"},
+                    "guard_veto": {"reason": "未完结"},
+                },
+            }
+        })
+        lifecycle = MagicMock()
+        plugin._modules["lifecycle"] = lifecycle
+
+        plugin.run_pending_release()
+
+        lifecycle.release_pending_source.assert_any_call(
+            sub,
+            source="guard_veto",
+            reason="待定释放巡检",
+        )
 
     def test_pending_release_active_guard_veto_recomputes_l_with_plugin_resolver(self, monkeypatch):
         """活跃 guard_veto 巡检要带插件主程序缺集 resolver 重算 L。"""
@@ -3185,6 +3323,34 @@ class TestNoDownloadCheck:
             "paused_probe_resume_guard_reason",
             "paused_probe_resume_guard_until",
         ])
+
+    def test_no_download_pause_action_delegates_to_lifecycle(self):
+        """无下载暂停只由生命周期协调器执行，完成/删除动作仍留在入口本地处理。"""
+        subscribe = _sub(id=30, state="R", name="测试", type="电视剧", season=1)
+        mediainfo = _mediainfo(
+            season_info=[{"season_number": 1, "air_date": "2025-01-01"}],
+            first_air_date="2025-01-01",
+        )
+        plugin = SubscribeAssistantEnhanced()
+        plugin.init_plugin({
+            "tv_no_download_days": 180,
+            "no_download_actions": ["pause_tv"],
+        })
+        plugin._subscribe_oper = MagicMock()
+        plugin._subscribe_oper.list.return_value = [subscribe]
+        plugin._recognize_mediainfo = MagicMock(return_value=mediainfo)
+        plugin._last_download_date = MagicMock(return_value=None)
+        lifecycle = MagicMock()
+        lifecycle.pause_for_no_download.return_value = LifecycleResult(changed=True)
+        plugin._modules["lifecycle"] = lifecycle
+        plugin._modules["pause_manager"].pause = MagicMock()
+
+        plugin.run_no_download_check()
+
+        lifecycle.pause_for_no_download.assert_called_once()
+        assert lifecycle.pause_for_no_download.call_args.args[0] is subscribe
+        assert "无下载截止日" in lifecycle.pause_for_no_download.call_args.args[1]
+        plugin._modules["pause_manager"].pause.assert_not_called()
 
     def test_overdue_tv_pause_action_respects_resume_guard(self):
         """下载命中恢复保护期内，无下载巡检不清任务、不通知、不再次暂停。"""

@@ -20,7 +20,6 @@ from app.log import logger
 from app.core.context import MediaInfo
 from app.schemas.event import SubscribeEpisodesRefreshEventData
 
-from .engine.signals import last_aired_episode
 from .shared.log import detail
 from .shared.subscribe import (
     format_subscribe,
@@ -29,7 +28,6 @@ from .shared.subscribe import (
     is_tv_episode_best_version_subscribe,
     subscribe_from_source,
 )
-from .shared.update import update_subscribe
 
 
 def _event_data(event):
@@ -160,11 +158,7 @@ class EventProxy:
             pending_refresh.handle_refresh(data)
 
     def on_subscribe_added(self, event):
-        """SubscribeAdded → 用户名自动暂停 + 上映前暂停 + 剧集待定 / 播出暂停。
-
-        全集洗版保留用户名和上映前暂停，跳过按集播出暂停/待定；
-        分集洗版和普通剧集继续按 TMDB 集数和播出间隔判定。
-        """
+        """SubscribeAdded → 回填下载事实后委托 lifecycle 处理新增态状态流转。"""
         data = event.event_data
         if not isinstance(data, dict):
             return
@@ -176,14 +170,6 @@ class EventProxy:
         if not subscribe:
             return
         detail(f"订阅新增事件：{format_subscribe(subscribe)}(id={subscribe_id})")
-
-        pause_manager = self.get("pause_manager")
-        auto_paused = False
-        if pause_manager:
-            auto_paused = pause_manager.check_auto_pause_for_user(subscribe) is True
-            if auto_paused:
-                detail(f"订阅新增：{format_subscribe(subscribe)} 已按用户名规则暂停，跳过后续新增态判定")
-                return
 
         priority = self.get("priority_manager")
         if (
@@ -207,52 +193,9 @@ class EventProxy:
             detail(f"订阅新增：{format_subscribe(subscribe)} 媒体信息缺失，跳过播出暂停/待定")
             return
 
-        full_best_version = is_full_best_version_subscribe(subscribe)
-        is_tv = self.get("is_tv_fn")
-        is_tv_media = True if is_tv is None else bool(is_tv(mediainfo))
-        tmdb_episodes_fn = self.get("tmdb_episodes_fn")
-        episodes = []
-        if is_tv_media and tmdb_episodes_fn:
-            episodes = tmdb_episodes_fn(
-                subscribe.tmdbid,
-                subscribe.season,
-                episode_group=subscribe.episode_group,
-            )
-
-        # 上映前暂停同时适用于电影和剧集，必须先于剧集专属流程判定。
-        airing = self.get("airing_checker")
-        if airing and pause_manager:
-            record = airing.check_pre_air(subscribe, mediainfo, episodes=episodes)
-            if record:
-                logger.info(f"订阅新增：{format_subscribe(subscribe)} 满足上映前暂停条件，置为禁用")
-                pause_manager.pause(subscribe, record)
-                return
-
-        if full_best_version:
-            # 全集洗版已完成用户名和上映前暂停检查，后续按集播出/待定流程不适用。
-            detail(f"订阅新增：{format_subscribe(subscribe)} 为全集洗版，跳过按集播出暂停/待定")
-            return
-
-        if is_tv is not None and not is_tv_media:
-            return
-
-        # TV 待定优先于播出暂停：满足待定条件即进入待定并跳过播出暂停。
-        pending_judge = self.get("pending_judge")
-        if pending_judge:
-            should, reason = pending_judge.should_enter_pending(subscribe, mediainfo, episodes)
-            if should:
-                logger.info(f"订阅新增：{format_subscribe(subscribe)} 判定进入待定（{reason}）")
-                if subscribe.state == "N" and not auto_paused:
-                    self._schedule_initial_pending_search(subscribe)
-                pending_judge.mark_pending(subscribe, source="pending_judge", reason=reason)
-                return
-
-        # N 态订阅尚未跑完首轮搜索，不做播出间隔暂停；下载整理入库后由 TransferComplete 即时复核。
-        if subscribe.state == "N":
-            detail(f"订阅新增：{format_subscribe(subscribe)} 仍为新增态，跳过播出间隔暂停")
-            return
-
-        self._pause_after_library_update(subscribe, mediainfo, episodes, source="订阅新增")
+        lifecycle = self.get("lifecycle")
+        if lifecycle:
+            lifecycle.handle_subscribe_added(subscribe, mediainfo)
 
     def on_subscribe_deleted(self, event):
         """SubscribeDeleted → 清理该订阅关联的全部任务数据（订阅任务 + 名下种子任务）。"""
@@ -289,17 +232,13 @@ class EventProxy:
             return
 
         if "state" in different_keys:
-            pause_manager = self.get("pause_manager")
-            if pause_manager:
+            lifecycle = self.get("lifecycle")
+            if lifecycle:
                 old_state = old_info.get("state")
                 new_state = subscribe_info.get("state", subscribe.state)
-                if old_state != "S" and new_state == "S":
-                    if not pause_manager.get_pause_record(subscribe):
-                        detail(f"订阅修改事件：{format_subscribe(subscribe)} 状态变为暂停，登记外部暂停")
-                        pause_manager.adopt_external(subscribe)
-                elif old_state == "S" and new_state != "S":
-                    detail(f"订阅修改事件：{format_subscribe(subscribe)} 状态已脱离暂停，清理插件暂停记录")
-                    pause_manager.clear_pause_record(subscribe)
+                lifecycle.handle_subscribe_modified_state_change(
+                    subscribe, old_state=old_state, new_state=new_state
+                )
 
         # 只在普通订阅首次切成洗版时回填；插件后续写进度字段也会触发修改事件，不能重复回填。
         if ("best_version" in different_keys
@@ -577,33 +516,10 @@ class EventProxy:
                 title=getattr(torrent_info, "title", None),
                 description=getattr(torrent_info, "description", None),
             )
-        self._resume_paused_subscribe_on_download(subscribe)
-
-    def _resume_paused_subscribe_on_download(self, subscribe):
-        """下载事实命中暂停订阅时恢复为订阅中，并按原暂停原因维护防打回窗口。"""
-        pause_manager = self.get("pause_manager")
-        if not pause_manager or not subscribe or subscribe.state != "S":
-            return
-        record = pause_manager.get_pause_record(subscribe)
-        if not record:
-            pause_manager.adopt_external(subscribe)
-            record = pause_manager.get_pause_record(subscribe)
-        if not record:
-            logger.info(f"DownloadAdded：{format_subscribe(subscribe)} 暂停记录缺失，跳过下载命中恢复")
-            return
-        reason = record.reason
-        if not pause_manager.resume(subscribe, notify=False):
-            logger.info(f"DownloadAdded：{format_subscribe(subscribe)} 暂停恢复未生效，原因={reason}")
-            return
-        pause_manager.clear_probe_fields_for_resume(subscribe)
-        guard_written = False
-        if reason != "external":
-            guard_written = pause_manager.set_resume_guard(subscribe, reason, hours=48)
-        logger.info(
-            f"DownloadAdded：{format_subscribe(subscribe)} 已因下载命中恢复暂停订阅，"
-            f"原暂停原因={reason}，写入防打回={guard_written}"
-        )
-        self._notify_download_resume(subscribe, reason)
+        lifecycle = self.get("lifecycle")
+        result = lifecycle.handle_download_added_for_subscribe(subscribe) if lifecycle else None
+        if result and result.changed:
+            self._notify_download_resume(subscribe, result.reason)
 
     def _notify_download_resume(self, subscribe, reason: str):
         """发送下载命中恢复暂停订阅通知；实际推送仍由全局通知开关控制。"""
@@ -671,47 +587,10 @@ class EventProxy:
         if transfer_info and transfer_info.transfer_type == "move" and task_manager:
             detail(f"TransferComplete：移动模式清理已完成下载任务 hash={download_hash}")
             task_manager.clean_torrent_tasks(download_hash)
-        self._pause_after_transfer_complete(subscribe_id)
+        lifecycle = self.get("lifecycle")
+        if lifecycle:
+            lifecycle.handle_library_updated(subscribe_id)
         self._convert_episode_best_version_to_full_if_ready(subscribe_id)
-
-    def _pause_after_transfer_complete(self, subscribe_id):
-        """整理入库后即时复核播出暂停，避免短窗口配置只能等周期巡检。"""
-        if not subscribe_id:
-            return
-        subscribe_oper = self.get("subscribe_oper")
-        recognize = self.get("recognize_mediainfo_fn")
-        is_tv = self.get("is_tv_fn")
-        tmdb_episodes_fn = self.get("tmdb_episodes_fn")
-        if not (subscribe_oper and recognize and is_tv and tmdb_episodes_fn):
-            return
-        subscribe = subscribe_oper.get(subscribe_id)
-        if not subscribe or subscribe.state != "R" or is_full_best_version_subscribe(subscribe):
-            return
-        mediainfo = recognize(subscribe)
-        if not mediainfo or not is_tv(mediainfo):
-            return
-        episodes = tmdb_episodes_fn(
-            subscribe.tmdbid,
-            subscribe.season,
-            episode_group=subscribe.episode_group,
-        )
-        self._pause_after_library_update(subscribe, mediainfo, episodes, source="TransferComplete")
-
-    def _pause_after_library_update(self, subscribe, mediainfo, episodes: list, source: str):
-        """媒体库状态已更新后，按当前播出窗口决定是否暂停订阅。"""
-        airing = self.get("airing_checker")
-        pause_manager = self.get("pause_manager")
-        if not (airing and pause_manager):
-            return
-        record = airing.check(
-            subscribe, mediainfo,
-            next_episode=mediainfo.next_episode_to_air,
-            latest_episode=last_aired_episode(episodes),
-            episodes=episodes,
-        )
-        if record:
-            logger.info(f"{source}：{format_subscribe(subscribe)} 满足播出间隔暂停条件，置为禁用")
-            pause_manager.pause(subscribe, record)
 
     def _convert_episode_best_version_to_full_if_ready(self, subscribe_id):
         """整理完成后补偿检查当前分集洗版订阅，避免目标集已齐全还要等下一次洗版巡检。"""
@@ -786,9 +665,14 @@ class EventProxy:
             return
         if len(matched) == 1:
             subscribe = matched[0]
-            new_state = "S" if subscribe.state != "S" else "R"
+            lifecycle = self.get("lifecycle")
+            if not lifecycle:
+                logger.warning(f"订阅切换命令：{format_subscribe(subscribe)} 生命周期未就绪，跳过状态切换")
+                notify("订阅生命周期未就绪，无法切换订阅状态")
+                return
+            result = lifecycle.toggle_subscribe_by_user_command(subscribe)
+            new_state = result.state or ("S" if subscribe.state != "S" else "R")
             logger.info(f"订阅切换命令：{format_subscribe(subscribe)} 状态切换为 {new_state}")
-            update_subscribe(subscribe_oper, subscribe.id, {"state": new_state})
             notify(f"{format_subscribe(subscribe)} 已{'禁用' if new_state == 'S' else '启用'}")
         else:
             lines = [f"{s.id}. {s.name}" for s in matched]
