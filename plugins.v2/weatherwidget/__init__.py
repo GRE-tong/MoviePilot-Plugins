@@ -85,13 +85,13 @@ class WeatherWidget(_PluginBase):
     # region 全局定义
 
     # 插件名称
-    plugin_name = "天气"
+    plugin_name = "天气（修改）"
     # 插件描述
     plugin_desc = "定时推送天气，并在仪表盘中显示实时天气。"
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/InfinityPacer/MoviePilot-Plugins/main/icons/weatherwidget.png"
     # 插件版本
-    plugin_version = "2.0"
+    plugin_version = "2.1"
     # 插件作者
     plugin_author = "InfinityPacer"
     # 作者主页
