@@ -1325,6 +1325,11 @@ class WeatherWidget(_PluginBase):
             current_time = soup.find("p", class_="current-time")
             if current_time:
                 weather_report_parts.append(f"当前时间: {current_time.text.strip()}")
+                
+            # 提取天气汇总
+            weather_abstract = soup.find("div", class_="current-abstract")
+            if weather_abstract:
+                weather_report_parts.append(f"\n{weather_abstract.text.strip()}")
 
             # 提取温度
             temperature = soup.find("div", class_="current-live__item")
@@ -1356,11 +1361,6 @@ class WeatherWidget(_PluginBase):
                     content = p0.text.strip()
                     label = p1.text.strip()
                     weather_report_parts.append(f"{label}: {content}")
-
-            # 提取天气汇总
-            weather_abstract = soup.find("div", class_="current-abstract")
-            if weather_abstract:
-                weather_report_parts.append(f"\n{weather_abstract.text.strip()}")
 
             # 构建和返回最终的天气报告
             if not weather_report_parts:
